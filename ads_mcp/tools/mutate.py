@@ -114,10 +114,14 @@ def _check_budget(daily_budget_usd: Any) -> float:
 
 
 def _check_owned(resource_name: str, cid: str, kind: str) -> str:
-    """Resource must live under the authorized account.
+    """Resource must live under the authorized account, with a numeric id.
 
     Stops a caller from passing customer_id=<allowed> while pointing the
-    operation at `customers/<other>/...`.
+    operation at `customers/<other>/...`, and pins the id segment to digits so
+    the value is safe to use in a GAQL literal (no injection surface) and can
+    never be a malformed/crafted resource name.
+
+    Returns the validated resource name.
     """
     prefix = f"customers/{cid}/{kind}/"
     if not isinstance(resource_name, str) or not resource_name.startswith(prefix):
@@ -125,7 +129,18 @@ def _check_owned(resource_name: str, cid: str, kind: str) -> str:
             f"resource_name {resource_name!r} does not belong to account {cid} "
             f"(expected it to start with {prefix!r})."
         )
+    entity_id = resource_name[len(prefix):]
+    if not entity_id.isdigit():
+        raise ToolError(
+            f"resource_name {resource_name!r} has a non-numeric id segment "
+            f"({entity_id!r}); expected {prefix}<digits>."
+        )
     return resource_name
+
+
+def _entity_id(resource_name: str) -> str:
+    """Digit-only id from a resource name already validated by _check_owned."""
+    return resource_name.rsplit("/", 1)[-1]
 
 
 # Ads may only point at domains we control. An LLM-driven tool that can set an
@@ -496,13 +511,15 @@ def update_campaign_status(
     if status_up == "ENABLED" and not validate_only:
         try:
             ga = client.get_service("GoogleAdsService")
+            # campaign_id is digit-only (enforced by _check_owned above), so it
+            # is safe as a GAQL literal — no user text reaches the query.
+            campaign_id = _entity_id(campaign_resource_name)
             rows = list(
                 ga.search(
                     customer_id=cid,
                     query=(
                         "SELECT campaign.name, campaign_budget.amount_micros "
-                        "FROM campaign WHERE campaign.resource_name = "
-                        f"'{campaign_resource_name}'"
+                        f"FROM campaign WHERE campaign.id = {campaign_id}"
                     ),
                 )
             )
