@@ -22,6 +22,7 @@ Safety model:
   * Daily budgets are capped by MAX_DAILY_BUDGET_USD.
 """
 
+import os
 from typing import Any, Dict, List
 from fastmcp import FastMCP
 from mcp.types import ToolAnnotations
@@ -35,11 +36,54 @@ mutate_mcp = FastMCP("mutate")
 
 # Hard ceiling — any create/update above this is rejected before hitting the API.
 MAX_DAILY_BUDGET_USD = 50.0
+# Per-click bid ceiling. A budget cap alone doesn't stop a runaway CPC from
+# burning the day's budget in a handful of terrible-quality clicks.
+MAX_CPC_BID_USD = 20.0
+
+# Account allowlist. The OAuth credentials can reach every account the user can
+# (often including unrelated businesses), and this server is driven by an LLM
+# that reads untrusted text (web pages, API responses, research files). Without
+# a scope check, a prompt injection could enable or remove campaigns in an
+# account that has nothing to do with this project. Set
+# GADS_MCP_ALLOWED_CUSTOMER_IDS (comma-separated) to override.
+_DEFAULT_ALLOWED = "5163667250"
+ALLOWED_CUSTOMER_IDS = {
+    c.replace("-", "").strip()
+    for c in os.environ.get("GADS_MCP_ALLOWED_CUSTOMER_IDS", _DEFAULT_ALLOWED).split(",")
+    if c.strip()
+}
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 def _cid(customer_id: str) -> str:
-    return str(customer_id).replace("-", "").strip()
+    """Normalize and authorize the target account for a mutating call."""
+    cid = str(customer_id).replace("-", "").strip()
+    if not cid.isdigit():
+        raise ToolError(f"customer_id must be 10 digits, got {customer_id!r}")
+    if cid not in ALLOWED_CUSTOMER_IDS:
+        raise ToolError(
+            f"Account {cid} is not in this server's allowlist "
+            f"({sorted(ALLOWED_CUSTOMER_IDS)}). Mutations are refused for accounts "
+            "outside it. Set GADS_MCP_ALLOWED_CUSTOMER_IDS to change this."
+        )
+    return cid
+
+
+def _check_cpc(usd: Any, label: str = "cpc") -> float:
+    """Validate a bid: finite, positive, and under the per-click ceiling."""
+    try:
+        val = float(usd)
+    except (TypeError, ValueError):
+        raise ToolError(f"{label} must be a number, got {usd!r}")
+    if val != val or val in (float("inf"), float("-inf")):
+        raise ToolError(f"{label} must be a finite number, got {usd!r}")
+    if val <= 0:
+        raise ToolError(f"{label} must be greater than 0, got {val}")
+    if val > MAX_CPC_BID_USD:
+        raise ToolError(
+            f"{label} ${val} exceeds the per-click ceiling ${MAX_CPC_BID_USD}."
+        )
+    return val
 
 
 def _micros(usd: float) -> int:
@@ -54,12 +98,71 @@ def _sanitize(text: str) -> str:
     return text.replace("  ", " ").strip()
 
 
-def _check_budget(daily_budget_usd: float) -> None:
-    if daily_budget_usd > MAX_DAILY_BUDGET_USD:
+def _check_budget(daily_budget_usd: Any) -> float:
+    try:
+        val = float(daily_budget_usd)
+    except (TypeError, ValueError):
+        raise ToolError(f"daily_budget_usd must be a number, got {daily_budget_usd!r}")
+    if val != val or val in (float("inf"), float("-inf")) or val <= 0:
+        raise ToolError(f"daily_budget_usd must be finite and > 0, got {daily_budget_usd!r}")
+    if val > MAX_DAILY_BUDGET_USD:
         raise ToolError(
-            f"Daily budget ${daily_budget_usd} exceeds the safety ceiling "
+            f"Daily budget ${val} exceeds the safety ceiling "
             f"${MAX_DAILY_BUDGET_USD}. Lower it or raise MAX_DAILY_BUDGET_USD."
         )
+    return val
+
+
+def _check_owned(resource_name: str, cid: str, kind: str) -> str:
+    """Resource must live under the authorized account.
+
+    Stops a caller from passing customer_id=<allowed> while pointing the
+    operation at `customers/<other>/...`.
+    """
+    prefix = f"customers/{cid}/{kind}/"
+    if not isinstance(resource_name, str) or not resource_name.startswith(prefix):
+        raise ToolError(
+            f"resource_name {resource_name!r} does not belong to account {cid} "
+            f"(expected it to start with {prefix!r})."
+        )
+    return resource_name
+
+
+# Ads may only point at domains we control. An LLM-driven tool that can set an
+# ad's destination is an injection target: pointing ads at an arbitrary domain
+# spends the account's money and risks suspension.
+ALLOWED_AD_DOMAINS = {
+    d.strip().lower()
+    for d in os.environ.get("GADS_MCP_ALLOWED_AD_DOMAINS", "ticketworld.travel").split(",")
+    if d.strip()
+}
+_MAX_URL_LEN = 2048
+_MAX_SUFFIX_LEN = 512
+
+
+def _check_final_url(url: str) -> str:
+    from urllib.parse import urlparse
+
+    if not isinstance(url, str) or len(url) > _MAX_URL_LEN:
+        raise ToolError(f"final_url must be a string under {_MAX_URL_LEN} chars.")
+    parsed = urlparse(url)
+    if parsed.scheme != "https":
+        raise ToolError(f"final_url must use https, got {parsed.scheme!r}.")
+    host = (parsed.hostname or "").lower()
+    if not any(host == d or host.endswith("." + d) for d in ALLOWED_AD_DOMAINS):
+        raise ToolError(
+            f"final_url host {host!r} is not in the allowed ad-destination domains "
+            f"({sorted(ALLOWED_AD_DOMAINS)}). Set GADS_MCP_ALLOWED_AD_DOMAINS to change."
+        )
+    return url
+
+
+def _check_url_suffix(suffix: str) -> str:
+    if not isinstance(suffix, str) or len(suffix) > _MAX_SUFFIX_LEN:
+        raise ToolError(f"final_url_suffix must be a string under {_MAX_SUFFIX_LEN} chars.")
+    if any(ch in suffix for ch in ("\n", "\r", " ", "#")):
+        raise ToolError("final_url_suffix must be url-encoded query params (no spaces/newlines/#).")
+    return suffix
 
 
 def _raise(ex: GoogleAdsException) -> None:
@@ -136,7 +239,7 @@ def create_campaign(
         c.geo_target_type_setting.positive_geo_target_type = enums.PositiveGeoTargetTypeEnum.PRESENCE
         c.geo_target_type_setting.negative_geo_target_type = enums.NegativeGeoTargetTypeEnum.PRESENCE
         if final_url_suffix:
-            c.final_url_suffix = final_url_suffix
+            c.final_url_suffix = _check_url_suffix(final_url_suffix)
         c.contains_eu_political_advertising = (
             enums.EuPoliticalAdvertisingStatusEnum.DOES_NOT_CONTAIN_EU_POLITICAL_ADVERTISING
         )
@@ -199,6 +302,7 @@ def create_ad_group(
         validate_only: If True, validate without creating.
     """
     cid = _cid(customer_id)
+    _check_owned(campaign_resource_name, cid, "campaigns")
     client = utils.get_googleads_client()
     enums = client.enums
     try:
@@ -209,7 +313,7 @@ def create_ad_group(
         ag.status = enums.AdGroupStatusEnum.ENABLED
         ag.type_ = enums.AdGroupTypeEnum.SEARCH_STANDARD
         ag.ad_rotation_mode = enums.AdGroupAdRotationModeEnum.ROTATE_FOREVER
-        ag.cpc_bid_micros = _micros(default_cpc_usd)
+        ag.cpc_bid_micros = _micros(_check_cpc(default_cpc_usd, "default_cpc_usd"))
         req = client.get_type("MutateAdGroupsRequest")
         req.customer_id = cid
         req.operations.append(op)
@@ -242,6 +346,8 @@ def create_responsive_search_ad(
         pinned_headline1: If given, that headline is pinned to position 1.
     """
     cid = _cid(customer_id)
+    _check_owned(ad_group_resource_name, cid, "adGroups")
+    _check_final_url(final_url)
     client = utils.get_googleads_client()
     enums = client.enums
     try:
@@ -288,6 +394,7 @@ def add_keywords(
         keywords: list of {text, match_type: EXACT|PHRASE|BROAD, cpc_usd?}.
     """
     cid = _cid(customer_id)
+    _check_owned(ad_group_resource_name, cid, "adGroups")
     client = utils.get_googleads_client()
     enums = client.enums
     try:
@@ -302,7 +409,7 @@ def add_keywords(
                 enums.KeywordMatchTypeEnum, str(kw.get("match_type", "PHRASE")).upper()
             )
             if kw.get("cpc_usd"):
-                crit.cpc_bid_micros = _micros(kw["cpc_usd"])
+                crit.cpc_bid_micros = _micros(_check_cpc(kw["cpc_usd"], "keyword cpc_usd"))
             ops.append(op)
         req = client.get_type("MutateAdGroupCriteriaRequest")
         req.customer_id = cid
@@ -328,6 +435,7 @@ def add_negative_keywords(
         keywords: list of {text, match_type: EXACT|PHRASE|BROAD}.
     """
     cid = _cid(customer_id)
+    _check_owned(campaign_resource_name, cid, "campaigns")
     client = utils.get_googleads_client()
     enums = client.enums
     try:
@@ -359,16 +467,57 @@ def update_campaign_status(
     campaign_resource_name: str,
     status: str,
     validate_only: bool = False,
+    confirm_destructive: bool = False,
 ) -> Dict[str, Any]:
     """Set a campaign's status: ENABLED, PAUSED or REMOVED.
 
     This is the ONLY way a campaign starts spending (status=ENABLED).
+
+    Guards:
+      * The campaign must belong to the authorized account.
+      * ENABLED is refused if the campaign's existing daily budget exceeds
+        MAX_DAILY_BUDGET_USD — otherwise enabling a pre-existing big-budget
+        campaign would bypass the create-time ceiling.
+      * REMOVED requires confirm_destructive=True (removal is not undoable).
     """
     cid = _cid(customer_id)
+    _check_owned(campaign_resource_name, cid, "campaigns")
     status_up = status.upper()
     if status_up not in ("ENABLED", "PAUSED", "REMOVED"):
         raise ToolError("status must be one of ENABLED, PAUSED, REMOVED")
+    if status_up == "REMOVED" and not confirm_destructive:
+        raise ToolError(
+            "Removing a campaign is not undoable. Re-call with "
+            "confirm_destructive=True if that is really intended."
+        )
     client = utils.get_googleads_client()
+
+    # Enabling spends money — verify the existing budget is within the ceiling.
+    if status_up == "ENABLED" and not validate_only:
+        try:
+            ga = client.get_service("GoogleAdsService")
+            rows = list(
+                ga.search(
+                    customer_id=cid,
+                    query=(
+                        "SELECT campaign.name, campaign_budget.amount_micros "
+                        "FROM campaign WHERE campaign.resource_name = "
+                        f"'{campaign_resource_name}'"
+                    ),
+                )
+            )
+            if not rows:
+                raise ToolError(f"Campaign {campaign_resource_name} not found in account {cid}.")
+            budget_usd = rows[0].campaign_budget.amount_micros / 1_000_000
+            if budget_usd > MAX_DAILY_BUDGET_USD:
+                raise ToolError(
+                    f"Refusing to ENABLE '{rows[0].campaign.name}': its daily budget "
+                    f"${budget_usd:.2f} exceeds the safety ceiling ${MAX_DAILY_BUDGET_USD}. "
+                    "Lower the budget first (update_campaign_budget)."
+                )
+        except GoogleAdsException as ex:
+            _raise(ex)
+
     try:
         op = client.get_type("CampaignOperation")
         if status_up == "REMOVED":
@@ -400,6 +549,7 @@ def update_campaign_budget(
     """Change a campaign budget's daily amount (<= safety ceiling)."""
     _check_budget(daily_budget_usd)
     cid = _cid(customer_id)
+    _check_owned(budget_resource_name, cid, "campaignBudgets")
     client = utils.get_googleads_client()
     try:
         op = client.get_type("CampaignBudgetOperation")
