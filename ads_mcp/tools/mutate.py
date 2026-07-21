@@ -680,6 +680,88 @@ def add_callouts(
         _raise(ex)
 
 
+# ── create_shared_negative_list / add_shared_negatives ───────────────────────
+@mutate_mcp.tool(annotations=_MUT)
+def create_shared_negative_list(
+    customer_id: str,
+    name: str,
+    keywords: List[Dict[str, Any]] = [],
+    validate_only: bool = False,
+) -> Dict[str, Any]:
+    """Create a shared NEGATIVE_KEYWORDS list and optionally seed it.
+
+    Prefer a NEW scoped list over adding to a broad existing one: an
+    account-wide list is attached to every campaign, so a negative that is
+    correct for one product line can silently blind unrelated campaigns.
+
+    Args:
+        keywords: {text, match_type: EXACT|PHRASE|BROAD} items.
+    """
+    cid = _cid(customer_id)
+    client = utils.get_googleads_client()
+    try:
+        op = client.get_type("SharedSetOperation")
+        op.create.name = name
+        op.create.type_ = client.enums.SharedSetTypeEnum.NEGATIVE_KEYWORDS
+        req = client.get_type("MutateSharedSetsRequest")
+        req.customer_id = cid
+        req.operations.append(op)
+        req.validate_only = validate_only
+        res = client.get_service("SharedSetService").mutate_shared_sets(request=req)
+        if validate_only:
+            return {"name": name, "created": False, "validated_only": True}
+        rn = res.results[0].resource_name
+        added = 0
+        if keywords:
+            # add_shared_negatives may be a FastMCP tool wrapper or a plain
+            # function depending on registration order; unwrap defensively.
+            _add = getattr(add_shared_negatives, "fn", add_shared_negatives)
+            added = _add(
+                customer_id=cid, shared_set_resource_name=rn, keywords=keywords
+            )["added"]
+        return {"name": name, "shared_set_resource_name": rn, "members_added": added}
+    except GoogleAdsException as ex:
+        _raise(ex)
+
+
+@mutate_mcp.tool(annotations=_MUT)
+def add_shared_negatives(
+    customer_id: str,
+    shared_set_resource_name: str,
+    keywords: List[Dict[str, Any]],
+    validate_only: bool = False,
+) -> Dict[str, Any]:
+    """Add negative keywords to an existing shared list.
+
+    Args:
+        keywords: {text, match_type: EXACT|PHRASE|BROAD} items.
+    """
+    cid = _cid(customer_id)
+    _check_owned(shared_set_resource_name, cid, "sharedSets")
+    if not keywords:
+        raise ToolError("provide at least one keyword")
+    client = utils.get_googleads_client()
+    enums = client.enums
+    try:
+        ops = []
+        for kw in keywords:
+            op = client.get_type("SharedCriterionOperation")
+            op.create.shared_set = shared_set_resource_name
+            op.create.keyword.text = kw["text"]
+            op.create.keyword.match_type = getattr(
+                enums.KeywordMatchTypeEnum, str(kw.get("match_type", "PHRASE")).upper()
+            )
+            ops.append(op)
+        req = client.get_type("MutateSharedCriteriaRequest")
+        req.customer_id = cid
+        req.operations.extend(ops)
+        req.validate_only = validate_only
+        res = client.get_service("SharedCriterionService").mutate_shared_criteria(request=req)
+        return {"added": 0 if validate_only else len(res.results), "validated_only": validate_only}
+    except GoogleAdsException as ex:
+        _raise(ex)
+
+
 # ── attach_shared_negative_lists ─────────────────────────────────────────────
 @mutate_mcp.tool(annotations=_MUT)
 def attach_shared_negative_lists(
