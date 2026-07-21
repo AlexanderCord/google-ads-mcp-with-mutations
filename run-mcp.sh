@@ -21,11 +21,16 @@ export GOOGLE_ADS_DEVELOPER_TOKEN="${GOOGLE_ADS_DEVELOPER_TOKEN:-${GADS_DEVELOPE
 export GOOGLE_ADS_LOGIN_CUSTOMER_ID="${GOOGLE_ADS_LOGIN_CUSTOMER_ID:-${GADS_LOGIN_CUSTOMER_ID:-}}"
 
 cd "$HERE"
-# Use the project venv (see README-venv). Falls back to `uv` if present.
-if [ -x "$HERE/.venv/bin/google-ads-mcp" ]; then
-  exec "$HERE/.venv/bin/google-ads-mcp"
+# Run the package by module with an explicit PYTHONPATH rather than the
+# installed `google-ads-mcp` console script. The editable install's .pth path
+# hook does not resolve `ads_mcp` (it only ever imported because the CWD
+# happened to contain the package), so the console script dies with
+# ModuleNotFoundError when the client launches it. This is CWD-independent.
+export PYTHONPATH="$HERE${PYTHONPATH:+:$PYTHONPATH}"
+if [ -x "$HERE/.venv/bin/python" ]; then
+  exec "$HERE/.venv/bin/python" -m ads_mcp.server
 elif command -v uv >/dev/null 2>&1; then
-  exec uv run google-ads-mcp
+  exec uv run python -m ads_mcp.server
 else
   exec python -m ads_mcp.server
 fi
