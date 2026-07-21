@@ -68,14 +68,34 @@ def prevent_stdio_inheritance():
 
 
 def _create_credentials() -> google.auth.credentials.Credentials:
-    """Returns Application Default Credentials with the Google Ads scope, or the FastMCP token if found."""
+    """Returns credentials for the Google Ads API.
+
+    Resolution order:
+      1. A FastMCP-provided access token (HTTP/OAuth transport).
+      2. Installed-app refresh-token creds from GADS_* env vars — lets this
+         server reuse the same credentials as the project's other Ads tooling
+         (startup-research-agent/agents/google_ads_test/.env).
+      3. Application Default Credentials (gcloud / service account).
+    """
     from fastmcp.server.dependencies import get_access_token
     from google.oauth2.credentials import Credentials
 
     token_obj = get_access_token()
     if token_obj and token_obj.token:
-        # Create credentials using the access token provided by FastMCP
         return Credentials(token=token_obj.token)
+
+    client_id = os.environ.get("GADS_CLIENT_ID")
+    client_secret = os.environ.get("GADS_CLIENT_SECRET")
+    refresh_token = os.environ.get("GADS_REFRESH_TOKEN")
+    if client_id and client_secret and refresh_token:
+        return Credentials(
+            token=None,
+            refresh_token=refresh_token,
+            client_id=client_id,
+            client_secret=client_secret,
+            token_uri="https://oauth2.googleapis.com/token",
+            scopes=[_ADS_SCOPE],
+        )
 
     with prevent_stdio_inheritance():
         credentials, _ = google.auth.default(scopes=[_ADS_SCOPE])
@@ -83,18 +103,23 @@ def _create_credentials() -> google.auth.credentials.Credentials:
 
 
 def _get_developer_token() -> str:
-    """Returns the developer token from the environment variable GOOGLE_ADS_DEVELOPER_TOKEN."""
-    dev_token = os.environ.get("GOOGLE_ADS_DEVELOPER_TOKEN")
+    """Developer token from GOOGLE_ADS_DEVELOPER_TOKEN (or GADS_DEVELOPER_TOKEN)."""
+    dev_token = os.environ.get("GOOGLE_ADS_DEVELOPER_TOKEN") or os.environ.get(
+        "GADS_DEVELOPER_TOKEN"
+    )
     if dev_token is None:
         raise ValueError(
-            "GOOGLE_ADS_DEVELOPER_TOKEN environment variable not set."
+            "GOOGLE_ADS_DEVELOPER_TOKEN (or GADS_DEVELOPER_TOKEN) not set."
         )
     return dev_token
 
 
 def _get_login_customer_id() -> str | None:
-    """Returns login customer id, if set, from the environment variable GOOGLE_ADS_LOGIN_CUSTOMER_ID."""
-    return os.environ.get("GOOGLE_ADS_LOGIN_CUSTOMER_ID")
+    """Login customer id from GOOGLE_ADS_LOGIN_CUSTOMER_ID (or GADS_LOGIN_CUSTOMER_ID)."""
+    cid = os.environ.get("GOOGLE_ADS_LOGIN_CUSTOMER_ID") or os.environ.get(
+        "GADS_LOGIN_CUSTOMER_ID"
+    )
+    return cid.replace("-", "").strip() if cid else None
 
 
 def _get_googleads_client() -> GoogleAdsClient:
