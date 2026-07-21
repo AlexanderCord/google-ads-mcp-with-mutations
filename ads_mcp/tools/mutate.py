@@ -40,6 +40,12 @@ MAX_DAILY_BUDGET_USD = 50.0
 # burning the day's budget in a handful of terrible-quality clicks.
 MAX_CPC_BID_USD = 20.0
 
+# Asset field types remove_account_asset_links may unlink. This is an allowlist,
+# not a formatting nicety: the value is interpolated into a GAQL WHERE clause,
+# so an unconstrained string could broaden the query and unlink assets of every
+# type. Extend deliberately.
+REMOVABLE_FIELD_TYPES = {"SITELINK", "CALLOUT", "STRUCTURED_SNIPPET", "PROMOTION"}
+
 # Account allowlist. The OAuth credentials can reach every account the user can
 # (often including unrelated businesses), and this server is driven by an LLM
 # that reads untrusted text (web pages, API responses, research files). Without
@@ -693,25 +699,34 @@ def remove_account_asset_links(
     """
     cid = _cid(customer_id)
     ft = field_type.upper()
-    if not confirm_destructive:
+    if ft not in REMOVABLE_FIELD_TYPES:
         raise ToolError(
-            f"This unlinks ALL account-level {ft} assets. Re-call with "
-            "confirm_destructive=True if that is intended."
+            f"field_type must be one of {sorted(REMOVABLE_FIELD_TYPES)}, got {field_type!r}."
         )
     client = utils.get_googleads_client()
     try:
         ga = client.get_service("GoogleAdsService")
         rows = list(ga.search(customer_id=cid, query=(
-            "SELECT customer_asset.resource_name, asset.sitelink_asset.link_text, "
+            "SELECT customer_asset.resource_name, customer_asset.field_type, "
+            "asset.sitelink_asset.link_text, "
             "asset.callout_asset.callout_text FROM customer_asset "
             f"WHERE customer_asset.field_type = '{ft}' AND customer_asset.status = 'ENABLED'"
         )))
+        # Defence in depth: never unlink a type we did not ask for, even if the
+        # query were somehow broadened.
+        rows = [r for r in rows if r.customer_asset.field_type.name == ft]
         if not rows:
             return {"removed": 0, "detail": f"no enabled account-level {ft} assets"}
         removed = [
             (r.asset.sitelink_asset.link_text or r.asset.callout_asset.callout_text)
             for r in rows
         ]
+        if not confirm_destructive:
+            raise ToolError(
+                f"This unlinks {len(rows)} account-level {ft} asset(s): "
+                f"{', '.join(x or '(unnamed)' for x in removed)}. "
+                "Re-call with confirm_destructive=True if that is intended."
+            )
         ops = []
         for r in rows:
             op = client.get_type("CustomerAssetOperation")
