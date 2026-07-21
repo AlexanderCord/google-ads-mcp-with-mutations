@@ -680,6 +680,49 @@ def add_callouts(
         _raise(ex)
 
 
+# ── update_sitelink_url ──────────────────────────────────────────────────────
+@mutate_mcp.tool(annotations=_MUT)
+def update_sitelink_url(
+    customer_id: str,
+    asset_resource_name: str,
+    final_url: str,
+    validate_only: bool = False,
+) -> Dict[str, Any]:
+    """Repoint an existing sitelink asset at a new final URL.
+
+    Use this when a landing page's anchors change — a sitelink pointing at a
+    removed #anchor silently dumps paid clicks at the top of the page instead
+    of the section the sitelink promised.
+
+    Note assets are shared: if the same asset is linked to several campaigns,
+    this updates it for all of them. That is usually what you want, but check
+    the link list first if you are not sure.
+    """
+    cid = _cid(customer_id)
+    _check_owned(asset_resource_name, cid, "assets")
+    _check_final_url(final_url)
+    client = utils.get_googleads_client()
+    try:
+        op = client.get_type("AssetOperation")
+        asset = op.update
+        asset.resource_name = asset_resource_name
+        asset.final_urls.append(final_url)
+        client.copy_from(op.update_mask, field_mask_pb2.FieldMask(paths=["final_urls"]))
+        req = client.get_type("MutateAssetsRequest")
+        req.customer_id = cid
+        req.operations.append(op)
+        req.validate_only = validate_only
+        res = client.get_service("AssetService").mutate_assets(request=req)
+        return {
+            "asset": asset_resource_name,
+            "final_url": final_url,
+            "updated": 0 if validate_only else len(res.results),
+            "validated_only": validate_only,
+        }
+    except GoogleAdsException as ex:
+        _raise(ex)
+
+
 # ── remove_account_asset_links ───────────────────────────────────────────────
 @mutate_mcp.tool(annotations=_DESTRUCTIVE)
 def remove_account_asset_links(
