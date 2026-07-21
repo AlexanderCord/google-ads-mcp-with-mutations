@@ -555,6 +555,183 @@ def update_campaign_status(
         _raise(ex)
 
 
+# ── add_sitelinks ────────────────────────────────────────────────────────────
+@mutate_mcp.tool(annotations=_MUT)
+def add_sitelinks(
+    customer_id: str,
+    campaign_resource_name: str,
+    sitelinks: List[Dict[str, str]],
+    validate_only: bool = False,
+) -> Dict[str, Any]:
+    """Create sitelink assets and attach them to a campaign.
+
+    Campaign-level sitelinks OVERRIDE account-level ones. Without them a
+    campaign inherits whatever sits at account level, which is a common way to
+    end up advertising an unrelated destination on a paid click.
+
+    Args:
+        sitelinks: 2-8 items of {text (<=25 chars), url, description1?,
+            description2? (<=35 chars each)}. Urls are validated against the
+            allowed ad-destination domains.
+    """
+    cid = _cid(customer_id)
+    _check_owned(campaign_resource_name, cid, "campaigns")
+    if not 1 <= len(sitelinks) <= 8:
+        raise ToolError("provide between 1 and 8 sitelinks")
+    client = utils.get_googleads_client()
+    try:
+        asset_ops = []
+        for s in sitelinks:
+            text = _sanitize(str(s.get("text", "")))
+            if not 1 <= len(text) <= 25:
+                raise ToolError(f"sitelink text must be 1-25 chars, got {text!r}")
+            url = _check_final_url(s.get("url", ""))
+            op = client.get_type("AssetOperation")
+            a = op.create
+            a.sitelink_asset.link_text = text
+            for i, key in enumerate(("description1", "description2"), start=1):
+                d = _sanitize(str(s.get(key, "")))
+                if d:
+                    if len(d) > 35:
+                        raise ToolError(f"{key} must be <=35 chars, got {d!r}")
+                    setattr(a.sitelink_asset, key, d)
+            a.final_urls.append(url)
+            asset_ops.append(op)
+        areq = client.get_type("MutateAssetsRequest")
+        areq.customer_id = cid
+        areq.operations.extend(asset_ops)
+        areq.validate_only = validate_only
+        ares = client.get_service("AssetService").mutate_assets(request=areq)
+        if validate_only:
+            return {"sitelinks_validated": len(asset_ops), "validated_only": True}
+
+        link_ops = []
+        for r in ares.results:
+            op = client.get_type("CampaignAssetOperation")
+            x = op.create
+            x.campaign = campaign_resource_name
+            x.asset = r.resource_name
+            x.field_type = client.enums.AssetFieldTypeEnum.SITELINK
+            link_ops.append(op)
+        lreq = client.get_type("MutateCampaignAssetsRequest")
+        lreq.customer_id = cid
+        lreq.operations.extend(link_ops)
+        lres = client.get_service("CampaignAssetService").mutate_campaign_assets(request=lreq)
+        return {"sitelinks_attached": len(lres.results), "campaign": campaign_resource_name}
+    except GoogleAdsException as ex:
+        _raise(ex)
+
+
+# ── add_callouts ─────────────────────────────────────────────────────────────
+@mutate_mcp.tool(annotations=_MUT)
+def add_callouts(
+    customer_id: str,
+    campaign_resource_name: str,
+    callouts: List[str],
+    validate_only: bool = False,
+) -> Dict[str, Any]:
+    """Create callout assets (short benefit phrases) and attach to a campaign.
+
+    Args:
+        callouts: 2-10 strings, each <=25 chars.
+    """
+    cid = _cid(customer_id)
+    _check_owned(campaign_resource_name, cid, "campaigns")
+    if not 1 <= len(callouts) <= 10:
+        raise ToolError("provide between 1 and 10 callouts")
+    client = utils.get_googleads_client()
+    try:
+        asset_ops = []
+        for t in callouts:
+            text = _sanitize(str(t))
+            if not 1 <= len(text) <= 25:
+                raise ToolError(f"callout must be 1-25 chars, got {text!r}")
+            op = client.get_type("AssetOperation")
+            op.create.callout_asset.callout_text = text
+            asset_ops.append(op)
+        areq = client.get_type("MutateAssetsRequest")
+        areq.customer_id = cid
+        areq.operations.extend(asset_ops)
+        areq.validate_only = validate_only
+        ares = client.get_service("AssetService").mutate_assets(request=areq)
+        if validate_only:
+            return {"callouts_validated": len(asset_ops), "validated_only": True}
+
+        link_ops = []
+        for r in ares.results:
+            op = client.get_type("CampaignAssetOperation")
+            x = op.create
+            x.campaign = campaign_resource_name
+            x.asset = r.resource_name
+            x.field_type = client.enums.AssetFieldTypeEnum.CALLOUT
+            link_ops.append(op)
+        lreq = client.get_type("MutateCampaignAssetsRequest")
+        lreq.customer_id = cid
+        lreq.operations.extend(link_ops)
+        lres = client.get_service("CampaignAssetService").mutate_campaign_assets(request=lreq)
+        return {"callouts_attached": len(lres.results), "campaign": campaign_resource_name}
+    except GoogleAdsException as ex:
+        _raise(ex)
+
+
+# ── remove_account_asset_links ───────────────────────────────────────────────
+@mutate_mcp.tool(annotations=_DESTRUCTIVE)
+def remove_account_asset_links(
+    customer_id: str,
+    field_type: str = "SITELINK",
+    confirm_destructive: bool = False,
+    validate_only: bool = False,
+) -> Dict[str, Any]:
+    """Unlink account-level assets of a given type (SITELINK, CALLOUT, ...).
+
+    Account-level assets are inherited by every campaign that has none of its
+    own, so stale ones end up on unrelated ads. This removes the account-level
+    LINK only; the underlying assets remain and stay attached wherever they are
+    linked at campaign level.
+
+    Requires confirm_destructive=True.
+    """
+    cid = _cid(customer_id)
+    ft = field_type.upper()
+    if not confirm_destructive:
+        raise ToolError(
+            f"This unlinks ALL account-level {ft} assets. Re-call with "
+            "confirm_destructive=True if that is intended."
+        )
+    client = utils.get_googleads_client()
+    try:
+        ga = client.get_service("GoogleAdsService")
+        rows = list(ga.search(customer_id=cid, query=(
+            "SELECT customer_asset.resource_name, asset.sitelink_asset.link_text, "
+            "asset.callout_asset.callout_text FROM customer_asset "
+            f"WHERE customer_asset.field_type = '{ft}' AND customer_asset.status = 'ENABLED'"
+        )))
+        if not rows:
+            return {"removed": 0, "detail": f"no enabled account-level {ft} assets"}
+        removed = [
+            (r.asset.sitelink_asset.link_text or r.asset.callout_asset.callout_text)
+            for r in rows
+        ]
+        ops = []
+        for r in rows:
+            op = client.get_type("CustomerAssetOperation")
+            op.remove = r.customer_asset.resource_name
+            ops.append(op)
+        req = client.get_type("MutateCustomerAssetsRequest")
+        req.customer_id = cid
+        req.operations.extend(ops)
+        req.validate_only = validate_only
+        res = client.get_service("CustomerAssetService").mutate_customer_assets(request=req)
+        return {
+            "field_type": ft,
+            "removed": 0 if validate_only else len(res.results),
+            "unlinked": removed,
+            "validated_only": validate_only,
+        }
+    except GoogleAdsException as ex:
+        _raise(ex)
+
+
 # ── add_ad_schedule ──────────────────────────────────────────────────────────
 @mutate_mcp.tool(annotations=_MUT)
 def add_ad_schedule(
