@@ -555,6 +555,125 @@ def update_campaign_status(
         _raise(ex)
 
 
+# ── add_ad_schedule ──────────────────────────────────────────────────────────
+@mutate_mcp.tool(annotations=_MUT)
+def add_ad_schedule(
+    customer_id: str,
+    campaign_resource_name: str,
+    market_timezone: str,
+    day_start_hour: int = 6,
+    day_end_hour: int = 22,
+    night_bid_modifier: float = 0.55,
+    day_bid_modifier: float = 1.0,
+    validate_only: bool = False,
+) -> Dict[str, Any]:
+    """Add a day-parting schedule with bid modifiers, in the MARKET's local time.
+
+    Google runs ad schedules on the ACCOUNT's timezone, which is usually not the
+    timezone of the market you're targeting. You give local hours here (e.g.
+    06:00-22:00 Sydney) and this converts them to account time for you.
+
+    Covers all 24h so nothing is switched off: the daytime window gets
+    `day_bid_modifier` and the remaining night hours get `night_bid_modifier`
+    (0.55 = -45%). Set night_bid_modifier low to spend less at night while still
+    collecting data — preferable to a hard cut-off before you have hour-of-day
+    numbers. The same pattern is applied to all 7 days.
+
+    Args:
+        market_timezone: IANA tz of the target market, e.g. "Australia/Sydney",
+            "Europe/London".
+        day_start_hour / day_end_hour: local daytime window (0-23).
+        night_bid_modifier / day_bid_modifier: 0.1-10.0 (1.0 = no change).
+
+    Note: fails if the campaign already has ad-schedule criteria (they may not
+    overlap) — remove the existing ones first.
+    """
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    cid = _cid(customer_id)
+    _check_owned(campaign_resource_name, cid, "campaigns")
+    for label, mod in (("day_bid_modifier", day_bid_modifier), ("night_bid_modifier", night_bid_modifier)):
+        try:
+            mod = float(mod)
+        except (TypeError, ValueError):
+            raise ToolError(f"{label} must be a number, got {mod!r}")
+        if not (0.1 <= mod <= 10.0):
+            raise ToolError(f"{label} must be between 0.1 and 10.0, got {mod}")
+    if not (0 <= int(day_start_hour) <= 23 and 0 <= int(day_end_hour) <= 23):
+        raise ToolError("day_start_hour/day_end_hour must be 0-23 (local market time)")
+
+    client = utils.get_googleads_client()
+    enums = client.enums
+
+    # Account timezone drives ad schedules — read it rather than assume.
+    try:
+        ga = client.get_service("GoogleAdsService")
+        rows = list(ga.search(customer_id=cid, query="SELECT customer.time_zone FROM customer"))
+        account_tz = rows[0].customer.time_zone
+    except GoogleAdsException as ex:
+        _raise(ex)
+
+    try:
+        now = datetime.now(ZoneInfo(account_tz))
+        acct_off = now.utcoffset().total_seconds() / 3600
+        mkt_off = now.astimezone(ZoneInfo(market_timezone)).utcoffset().total_seconds() / 3600
+    except Exception as e:
+        raise ToolError(f"Bad timezone ({market_timezone!r} / {account_tz!r}): {e}")
+    shift = int(acct_off - mkt_off)  # local hour + shift = account hour
+
+    start = (int(day_start_hour) + shift) % 24
+    end = (int(day_end_hour) + shift) % 24
+
+    # Build 24h coverage in account time: daytime blocks + night blocks.
+    if start < end:
+        day_blocks, night_blocks = [(start, end)], [(0, start), (end, 24)]
+    else:  # daytime window wraps past account midnight
+        day_blocks, night_blocks = [(start, 24), (0, end)], [(end, start)]
+    day_blocks = [(a, b) for a, b in day_blocks if a < b]
+    night_blocks = [(a, b) for a, b in night_blocks if a < b]
+
+    days = [enums.DayOfWeekEnum.MONDAY, enums.DayOfWeekEnum.TUESDAY,
+            enums.DayOfWeekEnum.WEDNESDAY, enums.DayOfWeekEnum.THURSDAY,
+            enums.DayOfWeekEnum.FRIDAY, enums.DayOfWeekEnum.SATURDAY,
+            enums.DayOfWeekEnum.SUNDAY]
+    try:
+        ops = []
+        for day in days:
+            for blocks, modifier in ((day_blocks, float(day_bid_modifier)),
+                                     (night_blocks, float(night_bid_modifier))):
+                for start_h, end_h in blocks:
+                    op = client.get_type("CampaignCriterionOperation")
+                    crit = op.create
+                    crit.campaign = campaign_resource_name
+                    crit.bid_modifier = modifier
+                    crit.ad_schedule.day_of_week = day
+                    crit.ad_schedule.start_hour = start_h
+                    crit.ad_schedule.start_minute = enums.MinuteOfHourEnum.ZERO
+                    crit.ad_schedule.end_hour = end_h
+                    crit.ad_schedule.end_minute = enums.MinuteOfHourEnum.ZERO
+                    ops.append(op)
+        req = client.get_type("MutateCampaignCriteriaRequest")
+        req.customer_id = cid
+        req.operations.extend(ops)
+        req.validate_only = validate_only
+        res = client.get_service("CampaignCriterionService").mutate_campaign_criteria(request=req)
+        return {
+            "account_timezone": account_tz,
+            "market_timezone": market_timezone,
+            "shift_hours": shift,
+            "local_day_window": f"{int(day_start_hour):02d}:00-{int(day_end_hour):02d}:00",
+            "account_day_blocks": [f"{a:02d}:00-{b:02d}:00" for a, b in day_blocks],
+            "account_night_blocks": [f"{a:02d}:00-{b:02d}:00" for a, b in night_blocks],
+            "day_bid_modifier": float(day_bid_modifier),
+            "night_bid_modifier": float(night_bid_modifier),
+            "criteria_added": 0 if validate_only else len(res.results),
+            "validated_only": validate_only,
+        }
+    except GoogleAdsException as ex:
+        _raise(ex)
+
+
 # ── update_campaign_budget ───────────────────────────────────────────────────
 @mutate_mcp.tool(annotations=_MUT)
 def update_campaign_budget(
