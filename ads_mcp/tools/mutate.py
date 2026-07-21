@@ -1077,6 +1077,65 @@ def add_ad_schedule(
         _raise(ex)
 
 
+# ── update_conversion_action ─────────────────────────────────────────────────
+@mutate_mcp.tool(annotations=_MUT)
+def update_conversion_action(
+    customer_id: str,
+    conversion_action_resource_name: str,
+    counting_type: str = "",
+    primary_for_goal: bool = None,
+    validate_only: bool = False,
+) -> Dict[str, Any]:
+    """Update a conversion action's counting type and/or primary-for-goal flag.
+
+    `MANY_PER_CLICK` counts every fire, so one visitor clicking out three times
+    from a single ad click records three conversions. For an affiliate proxy
+    signal that badly overstates how many people actually engaged —
+    `ONE_PER_CLICK` makes the number mean "ad clicks that led to an action".
+
+    `primary_for_goal=False` keeps a proxy action out of automated bidding
+    while still reporting it.
+
+    Args:
+        counting_type: ONE_PER_CLICK | MANY_PER_CLICK (omit to leave unchanged).
+        primary_for_goal: omit (None) to leave unchanged.
+    """
+    cid = _cid(customer_id)
+    _check_owned(conversion_action_resource_name, cid, "conversionActions")
+    if not counting_type and primary_for_goal is None:
+        raise ToolError("nothing to update: pass counting_type and/or primary_for_goal")
+    paths = []
+    client = utils.get_googleads_client()
+    try:
+        op = client.get_type("ConversionActionOperation")
+        ca = op.update
+        ca.resource_name = conversion_action_resource_name
+        if counting_type:
+            ct = counting_type.upper()
+            if ct not in ("ONE_PER_CLICK", "MANY_PER_CLICK"):
+                raise ToolError("counting_type must be ONE_PER_CLICK or MANY_PER_CLICK")
+            ca.counting_type = getattr(client.enums.ConversionActionCountingTypeEnum, ct)
+            paths.append("counting_type")
+        if primary_for_goal is not None:
+            ca.primary_for_goal = primary_for_goal
+            paths.append("primary_for_goal")
+        client.copy_from(op.update_mask, field_mask_pb2.FieldMask(paths=paths))
+        req = client.get_type("MutateConversionActionsRequest")
+        req.customer_id = cid
+        req.operations.append(op)
+        req.validate_only = validate_only
+        client.get_service("ConversionActionService").mutate_conversion_actions(request=req)
+        return {
+            "conversion_action": conversion_action_resource_name,
+            "updated_fields": paths,
+            "counting_type": counting_type or "unchanged",
+            "primary_for_goal": primary_for_goal if primary_for_goal is not None else "unchanged",
+            "validated_only": validate_only,
+        }
+    except GoogleAdsException as ex:
+        _raise(ex)
+
+
 # ── update_campaign_budget ───────────────────────────────────────────────────
 @mutate_mcp.tool(annotations=_MUT)
 def update_campaign_budget(
