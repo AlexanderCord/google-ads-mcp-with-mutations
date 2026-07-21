@@ -680,6 +680,92 @@ def add_callouts(
         _raise(ex)
 
 
+# ── attach_shared_negative_lists ─────────────────────────────────────────────
+@mutate_mcp.tool(annotations=_MUT)
+def attach_shared_negative_lists(
+    customer_id: str,
+    campaign_resource_name: str,
+    shared_set_names: List[str],
+    validate_only: bool = False,
+) -> Dict[str, Any]:
+    """Attach account-level shared NEGATIVE_KEYWORDS lists to a campaign.
+
+    New campaigns do NOT inherit shared negative lists — each one must be
+    linked explicitly, which is easy to forget and expensive to miss (the
+    account's curated junk-traffic exclusions simply do not apply).
+
+    Looks the lists up by name, skips any already attached, and reports
+    anything it could not find rather than silently attaching a subset.
+    """
+    cid = _cid(customer_id)
+    _check_owned(campaign_resource_name, cid, "campaigns")
+    if not shared_set_names:
+        raise ToolError("provide at least one shared_set_name")
+    client = utils.get_googleads_client()
+    try:
+        ga = client.get_service("GoogleAdsService")
+        # Names are user text, so they must never be interpolated into GAQL.
+        # Pull the negative-keyword sets and match in Python instead.
+        available = {
+            r.shared_set.name: r.shared_set.resource_name
+            for r in ga.search(
+                customer_id=cid,
+                query=(
+                    "SELECT shared_set.resource_name, shared_set.name FROM shared_set "
+                    "WHERE shared_set.type = 'NEGATIVE_KEYWORDS' "
+                    "AND shared_set.status = 'ENABLED'"
+                ),
+            )
+        }
+        already = {
+            r.shared_set.resource_name
+            for r in ga.search(
+                customer_id=cid,
+                query=(
+                    "SELECT shared_set.resource_name, campaign.resource_name "
+                    "FROM campaign_shared_set"
+                ),
+            )
+            if r.campaign.resource_name == campaign_resource_name
+        }
+
+        missing = [n for n in shared_set_names if n not in available]
+        if missing:
+            raise ToolError(
+                f"no ENABLED negative-keyword shared set named {missing}. "
+                f"Available: {sorted(available)}"
+            )
+
+        ops, attached, skipped = [], [], []
+        for name in shared_set_names:
+            rn = available[name]
+            if rn in already:
+                skipped.append(name)
+                continue
+            op = client.get_type("CampaignSharedSetOperation")
+            op.create.campaign = campaign_resource_name
+            op.create.shared_set = rn
+            ops.append(op)
+            attached.append(name)
+
+        if not ops:
+            return {"attached": [], "already_attached": skipped}
+
+        req = client.get_type("MutateCampaignSharedSetsRequest")
+        req.customer_id = cid
+        req.operations.extend(ops)
+        req.validate_only = validate_only
+        client.get_service("CampaignSharedSetService").mutate_campaign_shared_sets(request=req)
+        return {
+            "campaign": campaign_resource_name,
+            "attached": attached,
+            "already_attached": skipped,
+            "validated_only": validate_only,
+        }
+    except GoogleAdsException as ex:
+        _raise(ex)
+
+
 # ── update_sitelink_url ──────────────────────────────────────────────────────
 @mutate_mcp.tool(annotations=_MUT)
 def update_sitelink_url(
